@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Scanner de Impressoras em Rede com Suporte a IPv4/IPv6
-Escaneia sub-redes para descobrir impressoras e coletar informações via SNMP
-Versão com Interface Gráfica e Barra de Progresso
+Interface moderna com Flet
 """
 
 import sys
@@ -22,12 +21,11 @@ except ImportError:
     sys.exit(1)
 
 try:
-    import tkinter as tk
-    from tkinter import ttk, scrolledtext
-    GUI_AVAILABLE = True
+    import flet as ft
+    FLET_AVAILABLE = True
 except ImportError:
-    GUI_AVAILABLE = False
-    print("Aviso: tkinter não disponível. Usando modo console.")
+    FLET_AVAILABLE = False
+    print("Aviso: Flet não disponível. Instale com: pip install flet")
 
 
 # OIDs SNMP padrão
@@ -56,12 +54,15 @@ SNMP_TIMEOUT = 1.5
 class PrinterInfo:
     """Classe para armazenar informações da impressora"""
     def __init__(self, ip: str, hostname: str = "", model: str = "", 
-                 page_count: int = 0, open_ports: Dict[int, str] = None):
+                 page_count: int = 0, open_ports: Dict[int, str] = None,
+                 snmp_community: str = "", snmp_version: str = ""):
         self.ip = ip
         self.hostname = hostname
         self.model = model
         self.page_count = page_count
         self.open_ports = open_ports or {}
+        self.snmp_community = snmp_community
+        self.snmp_version = snmp_version
 
 
 class ProgressTracker:
@@ -111,18 +112,19 @@ def scan_all_ports(ip: str) -> Dict[int, str]:
     return open_ports
 
 
-def snmp_get(ip: str, oid: str, timeout: int = SNMP_TIMEOUT) -> Optional[str]:
-    """Realiza uma consulta SNMP GET para obter um valor específico"""
+def snmp_get_with_community(ip: str, oid: str, community: str, version: int = 1, 
+                            timeout: int = SNMP_TIMEOUT) -> Optional[str]:
+    """Realiza consulta SNMP com community string específica"""
     try:
         ip_obj = ipaddress.ip_address(ip)
         if isinstance(ip_obj, ipaddress.IPv6Address):
-            transport = Udp6TransportTarget((ip, 161), timeout=timeout)
+            transport = Udp6TransportTarget((ip, 161), timeout=timeout, retries=0)
         else:
-            transport = UdpTransportTarget((ip, 161), timeout=timeout)
+            transport = UdpTransportTarget((ip, 161), timeout=timeout, retries=0)
         
         iterator = getCmd(
             SnmpEngine(),
-            CommunityData('public', mpModel=1),
+            CommunityData(community, mpModel=version),
             transport,
             ContextData(),
             ObjectType(ObjectIdentity(oid))
@@ -141,57 +143,47 @@ def snmp_get(ip: str, oid: str, timeout: int = SNMP_TIMEOUT) -> Optional[str]:
         return None
 
 
-def snmp_get_v1(ip: str, oid: str, timeout: int = SNMP_TIMEOUT) -> Optional[str]:
-    """Realiza uma consulta SNMP v1 GET (fallback)"""
-    try:
-        ip_obj = ipaddress.ip_address(ip)
-        if isinstance(ip_obj, ipaddress.IPv6Address):
-            transport = Udp6TransportTarget((ip, 161), timeout=timeout)
-        else:
-            transport = UdpTransportTarget((ip, 161), timeout=timeout)
-        
-        iterator = getCmd(
-            SnmpEngine(),
-            CommunityData('public', mpModel=0),  # SNMPv1
-            transport,
-            ContextData(),
-            ObjectType(ObjectIdentity(oid))
-        )
-        
-        errorIndication, errorStatus, errorIndex, varBinds = next(iterator)
-        
-        if errorIndication or errorStatus:
-            return None
-        
-        for varBind in varBinds:
-            return str(varBind[1])
-        
-        return None
-    except Exception:
-        return None
+def snmp_get(ip: str, oid: str, timeout: int = SNMP_TIMEOUT) -> Optional[tuple]:
+    """Tenta obter valor SNMP testando múltiplas community strings e versões"""
+    # Tenta SNMPv2c com cada community
+    for community in SNMP_COMMUNITIES:
+        result = snmp_get_with_community(ip, oid, community, version=1, timeout=timeout)
+        if result:
+            return (result, community, 'v2c')
+    
+    # Tenta SNMPv1 com cada community
+    for community in SNMP_COMMUNITIES:
+        result = snmp_get_with_community(ip, oid, community, version=0, timeout=timeout)
+        if result:
+            return (result, community, 'v1')
+    
+    return None
 
 
 def query_printer_info(ip: str, open_ports: Dict[int, str]) -> Optional[PrinterInfo]:
     """Consulta informações da impressora via SNMP"""
-    # Tenta SNMPv2c primeiro
-    sysdescr = snmp_get(ip, OID_SYSDESCR)
+    snmp_result = snmp_get(ip, OID_SYSDESCR)
     
-    # Se falhar, tenta SNMPv1
-    if sysdescr is None:
-        sysdescr = snmp_get_v1(ip, OID_SYSDESCR)
-    
-    # Se ainda falhar, retorna info básica apenas com portas
-    if sysdescr is None:
+    if snmp_result is None:
         return PrinterInfo(
             ip=ip, 
             hostname="", 
-            model="Dispositivo de impressão (SNMP não disponível)", 
+            model="⚠️ Dispositivo de rede (SNMP desabilitado ou bloqueado)", 
             page_count=0, 
-            open_ports=open_ports
+            open_ports=open_ports,
+            snmp_community="N/A",
+            snmp_version="N/A"
         )
     
-    sysname = snmp_get(ip, OID_SYSNAME) or snmp_get_v1(ip, OID_SYSNAME) or ""
-    page_count_str = snmp_get(ip, OID_PAGE_COUNTER) or snmp_get_v1(ip, OID_PAGE_COUNTER) or "0"
+    sysdescr, community, version = snmp_result
+    
+    sysname_result = snmp_get_with_community(ip, OID_SYSNAME, community, 
+                                             1 if version == 'v2c' else 0)
+    sysname = sysname_result if sysname_result else ""
+    
+    page_result = snmp_get_with_community(ip, OID_PAGE_COUNTER, community,
+                                          1 if version == 'v2c' else 0)
+    page_count_str = page_result if page_result else "0"
     
     try:
         page_count = int(page_count_str)
@@ -200,8 +192,15 @@ def query_printer_info(ip: str, open_ports: Dict[int, str]) -> Optional[PrinterI
     
     model = sysdescr.split('\n')[0].strip() if sysdescr else "Desconhecido"
     
-    return PrinterInfo(ip=ip, hostname=sysname, model=model, 
-                      page_count=page_count, open_ports=open_ports)
+    return PrinterInfo(
+        ip=ip, 
+        hostname=sysname, 
+        model=model, 
+        page_count=page_count, 
+        open_ports=open_ports,
+        snmp_community=community,
+        snmp_version=version
+    )
 
 
 def scan_single_host(ip_str: str) -> Tuple[str, Optional[PrinterInfo], str]:
@@ -211,298 +210,375 @@ def scan_single_host(ip_str: str) -> Tuple[str, Optional[PrinterInfo], str]:
     if not open_ports:
         return (ip_str, None, "no_printer_port")
     
-    # Sempre tenta consultar SNMP, mas retorna info básica se falhar
     printer_info = query_printer_info(ip_str, open_ports)
     
-    # Agora sempre retorna sucesso se encontrou portas de impressora
     if printer_info:
         return (ip_str, printer_info, "success")
     else:
-        # Caso extremo - não deveria acontecer com a nova lógica
         return (ip_str, None, "snmp_failed")
 
 
-def scan_subnet_console(subnet: str, max_workers: int = 100) -> List[PrinterInfo]:
-    """Escaneia uma sub-rede (modo console com barra de progresso)"""
-    printers = []
+class PrinterScannerApp:
+    """Aplicação Flet para scanner de impressoras"""
     
-    try:
-        network = ipaddress.ip_network(subnet, strict=False)
-        print(f"\n{'='*70}")
-        print(f"Escaneando sub-rede: {subnet}")
-        
-        total_hosts = network.num_addresses
-        if total_hosts > 1000:
-            print(f"Aviso: Sub-rede grande ({total_hosts} endereços).")
-            print(f"Limitando a 1000 hosts para otimização...")
-            hosts = list(network.hosts())[:1000]
-        else:
-            hosts = list(network.hosts())
-        
-        print(f"Total de hosts a escanear: {len(hosts)}")
-        print(f"Threads paralelas: {max_workers}")
-        print(f"Portas verificadas: {', '.join(map(str, PRINTER_PORTS.keys()))}")
-        print('='*70)
-        
-        progress = ProgressTracker(len(hosts))
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(scan_single_host, str(ip)): ip for ip in hosts}
-            
-            for future in as_completed(futures):
-                current = progress.increment()
-                percentage = progress.get_progress()
-                
-                # Barra de progresso
-                bar_length = 40
-                filled = int(bar_length * percentage / 100)
-                bar = '█' * filled + '░' * (bar_length - filled)
-                print(f"\rProgresso: [{bar}] {percentage:.1f}% ({current}/{len(hosts)})", 
-                      end='', flush=True)
-                
-                ip_str, printer_info, status = future.result()
-                
-                if status == "success" and printer_info:
-                    printers.append(printer_info)
-                    print()  # Nova linha
-                    print(f"\n{'='*70}")
-                    print("🖨️  IMPRESSORA ENCONTRADA!")
-                    print(f"{'='*70}")
-                    print(f"  IP:        {printer_info.ip}")
-                    if printer_info.hostname:
-                        print(f"  Nome:      {printer_info.hostname}")
-                    print(f"  Modelo:    {printer_info.model}")
-                    print(f"  Páginas:   {printer_info.page_count:,}")
-                    print(f"  Portas abertas:")
-                    for port, service in printer_info.open_ports.items():
-                        print(f"    • {port} - {service}")
-                    print('='*70)
-        
-        print()  # Nova linha após a barra
-        
-    except ValueError as e:
-        print(f"\nERRO: Sub-rede inválida '{subnet}': {e}")
-    
-    return printers
-
-
-class PrinterScannerGUI:
-    """Interface gráfica para o scanner de impressoras"""
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Scanner de Impressoras em Rede")
-        self.root.geometry("900x700")
-        self.root.resizable(True, True)
+    def __init__(self, page: ft.Page):
+        self.page = page
+        self.page.title = "🖨️ Scanner de Impressoras"
+        self.page.theme_mode = ft.ThemeMode.LIGHT
+        self.page.padding = 0
+        self.page.window_width = 1200
+        self.page.window_height = 800
         
         self.scanning = False
         self.printers = []
         
-        self.create_widgets()
+        # Cores
+        self.colors = {
+            'primary': '#0066cc',
+            'success': '#28a745',
+            'warning': '#ffc107',
+            'danger': '#dc3545',
+            'dark': '#343a40',
+            'light': '#f8f9fa',
+            'bg': '#ffffff'
+        }
+        
+        self.setup_ui()
     
-    def create_widgets(self):
-        # Frame superior - Configurações
-        config_frame = ttk.LabelFrame(self.root, text="Configurações", padding=10)
-        config_frame.pack(fill="x", padx=10, pady=5)
+    def setup_ui(self):
+        """Configura a interface do usuário"""
         
-        ttk.Label(config_frame, text="Sub-redes (CIDR):").grid(row=0, column=0, sticky="w")
-        self.subnet_entry = ttk.Entry(config_frame, width=40)
-        self.subnet_entry.insert(0, "192.168.1.0/24")
-        self.subnet_entry.grid(row=0, column=1, padx=5, pady=2)
+        # Header
+        header = ft.Container(
+            content=ft.Column([
+                ft.Text(
+                    "🖨️ Scanner de Impressoras em Rede",
+                    size=32,
+                    weight=ft.FontWeight.BOLD,
+                    color=ft.colors.WHITE
+                ),
+                ft.Text(
+                    "Detecte impressoras IPv4/IPv6 e obtenha informações via SNMP",
+                    size=14,
+                    color=ft.colors.WHITE70
+                )
+            ], spacing=5),
+            bgcolor=self.colors['primary'],
+            padding=30,
+            margin=ft.margin.only(bottom=20)
+        )
         
-        ttk.Label(config_frame, text="Threads:").grid(row=1, column=0, sticky="w")
-        self.threads_spinbox = ttk.Spinbox(config_frame, from_=10, to=200, width=10)
-        self.threads_spinbox.set(100)
-        self.threads_spinbox.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+        # Configurações
+        self.subnet_field = ft.TextField(
+            label="Sub-redes (CIDR)",
+            hint_text="Ex: 192.168.1.0/24 10.0.0.0/24",
+            value="192.168.1.0/24",
+            width=400,
+            border_color=self.colors['primary']
+        )
         
-        self.scan_button = ttk.Button(config_frame, text="🔍 Iniciar Scan", 
-                                      command=self.start_scan)
-        self.scan_button.grid(row=0, column=2, rowspan=2, padx=10)
+        self.threads_field = ft.TextField(
+            label="Threads",
+            value="100",
+            width=120,
+            keyboard_type=ft.KeyboardType.NUMBER,
+            border_color=self.colors['primary']
+        )
         
-        # Frame de progresso
-        progress_frame = ttk.LabelFrame(self.root, text="Progresso", padding=10)
-        progress_frame.pack(fill="x", padx=10, pady=5)
+        self.scan_button = ft.ElevatedButton(
+            "🔍 Iniciar Escaneamento",
+            on_click=self.start_scan,
+            bgcolor=self.colors['primary'],
+            color=ft.colors.WHITE,
+            height=50,
+            style=ft.ButtonStyle(
+                shape=ft.RoundedRectangleBorder(radius=8),
+            )
+        )
         
-        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate')
-        self.progress_bar.pack(fill="x", pady=2)
+        config_card = ft.Container(
+            content=ft.Column([
+                ft.Text("⚙️ Configurações", size=18, weight=ft.FontWeight.BOLD),
+                ft.Row([
+                    self.subnet_field,
+                    self.threads_field,
+                    self.scan_button
+                ], spacing=15, alignment=ft.MainAxisAlignment.START)
+            ], spacing=15),
+            bgcolor=ft.colors.WHITE,
+            padding=20,
+            border_radius=10,
+            border=ft.border.all(1, ft.colors.GREY_300)
+        )
         
-        self.status_label = ttk.Label(progress_frame, text="Pronto para escanear")
-        self.status_label.pack()
+        # Progresso
+        self.progress_bar = ft.ProgressBar(
+            width=float('inf'),
+            height=8,
+            color=self.colors['primary'],
+            bgcolor=ft.colors.GREY_300
+        )
         
-        # Frame de portas escaneadas
-        ports_frame = ttk.LabelFrame(self.root, text="Portas Verificadas", padding=5)
-        ports_frame.pack(fill="x", padx=10, pady=5)
+        self.status_text = ft.Text(
+            "✓ Pronto para escanear",
+            size=14,
+            color=self.colors['success'],
+            weight=ft.FontWeight.BOLD
+        )
         
-        ports_text = ", ".join([f"{p} ({s})" for p, s in PRINTER_PORTS.items()])
-        ttk.Label(ports_frame, text=ports_text, wraplength=850).pack()
+        self.stats_text = ft.Text(
+            "",
+            size=12,
+            color=ft.colors.GREY_700
+        )
         
-        # Frame de resultados
-        results_frame = ttk.LabelFrame(self.root, text="Resultados", padding=10)
-        results_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        progress_card = ft.Container(
+            content=ft.Column([
+                ft.Text("📊 Progresso", size=18, weight=ft.FontWeight.BOLD),
+                self.progress_bar,
+                ft.Row([
+                    self.status_text,
+                    self.stats_text
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+            ], spacing=10),
+            bgcolor=ft.colors.WHITE,
+            padding=20,
+            border_radius=10,
+            border=ft.border.all(1, ft.colors.GREY_300)
+        )
         
-        self.results_text = scrolledtext.ScrolledText(results_frame, wrap=tk.WORD, 
-                                                      height=20, font=("Consolas", 9))
-        self.results_text.pack(fill="both", expand=True)
+        # Portas verificadas
+        port_chips = []
+        for port, service in PRINTER_PORTS.items():
+            port_chips.append(
+                ft.Container(
+                    content=ft.Row([
+                        ft.Text(f":{port}", weight=ft.FontWeight.BOLD, size=12),
+                        ft.Text(service, size=11, color=ft.colors.GREY_700)
+                    ], spacing=5),
+                    bgcolor=ft.colors.BLUE_50,
+                    padding=ft.padding.symmetric(horizontal=12, vertical=6),
+                    border_radius=20
+                )
+            )
         
-        # Tags para cores
-        self.results_text.tag_config("header", foreground="blue", font=("Consolas", 10, "bold"))
-        self.results_text.tag_config("success", foreground="green")
-        self.results_text.tag_config("info", foreground="dark blue")
-        self.results_text.tag_config("warning", foreground="orange")
+        ports_card = ft.Container(
+            content=ft.Column([
+                ft.Text("🔌 Portas Verificadas", size=18, weight=ft.FontWeight.BOLD),
+                ft.Row(port_chips, wrap=True, spacing=8)
+            ], spacing=15),
+            bgcolor=ft.colors.WHITE,
+            padding=20,
+            border_radius=10,
+            border=ft.border.all(1, ft.colors.GREY_300)
+        )
+        
+        # Resultados
+        self.results_column = ft.Column(
+            [],
+            spacing=10,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True
+        )
+        
+        results_card = ft.Container(
+            content=ft.Column([
+                ft.Text("📋 Impressoras Encontradas", size=18, weight=ft.FontWeight.BOLD),
+                ft.Container(
+                    content=self.results_column,
+                    bgcolor=ft.colors.GREY_50,
+                    padding=15,
+                    border_radius=8,
+                    expand=True
+                )
+            ], spacing=15, expand=True),
+            bgcolor=ft.colors.WHITE,
+            padding=20,
+            border_radius=10,
+            border=ft.border.all(1, ft.colors.GREY_300),
+            expand=True
+        )
+        
+        # Layout principal
+        main_content = ft.Container(
+            content=ft.Column([
+                header,
+                ft.Container(
+                    content=ft.Column([
+                        config_card,
+                        progress_card,
+                        ports_card,
+                        results_card
+                    ], spacing=15, expand=True),
+                    padding=20,
+                    expand=True
+                )
+            ], spacing=0, expand=True),
+            bgcolor=self.colors['light'],
+            expand=True
+        )
+        
+        self.page.add(main_content)
     
-    def log(self, message, tag=None):
+    def add_log(self, message: str, color: str = None):
         """Adiciona mensagem ao log"""
-        self.results_text.insert(tk.END, message + "\n", tag)
-        self.results_text.see(tk.END)
-        self.root.update_idletasks()
+        log_text = ft.Text(
+            message,
+            size=13,
+            color=color or ft.colors.BLACK87,
+            font_family="Consolas"
+        )
+        self.results_column.controls.append(log_text)
+        self.page.update()
     
-    def start_scan(self):
-        """Inicia o escaneamento em uma thread separada"""
+    def add_printer_card(self, printer: PrinterInfo):
+        """Adiciona card de impressora encontrada"""
+        
+        # Portas abertas
+        port_badges = []
+        for port, service in printer.open_ports.items():
+            port_badges.append(
+                ft.Container(
+                    content=ft.Text(f":{port} - {service}", size=11),
+                    bgcolor=ft.colors.GREEN_50,
+                    padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                    border_radius=5
+                )
+            )
+        
+        # Card da impressora
+        printer_card = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Icon(ft.icons.PRINT, color=self.colors['success'], size=30),
+                    ft.Column([
+                        ft.Text(printer.ip, size=18, weight=ft.FontWeight.BOLD, color=self.colors['success']),
+                        ft.Text(printer.model, size=14, color=ft.colors.GREY_700)
+                    ], spacing=2)
+                ], spacing=15),
+                ft.Divider(height=1),
+                ft.Column([
+                    ft.Row([
+                        ft.Icon(ft.icons.LABEL, size=16, color=ft.colors.GREY_600),
+                        ft.Text(f"Nome: {printer.hostname or 'N/A'}", size=13)
+                    ], spacing=5) if printer.hostname else ft.Container(),
+                    ft.Row([
+                        ft.Icon(ft.icons.DESCRIPTION, size=16, color=ft.colors.GREY_600),
+                        ft.Text(f"Páginas: {printer.page_count:,}", size=13, weight=ft.FontWeight.BOLD)
+                    ], spacing=5),
+                    ft.Row([
+                        ft.Icon(ft.icons.SECURITY, size=16, color=ft.colors.GREY_600),
+                        ft.Text(f"SNMP: {printer.snmp_version} (community: '{printer.snmp_community}')", size=13)
+                    ], spacing=5) if printer.snmp_community != "N/A" else ft.Container(),
+                    ft.Column([
+                        ft.Row([
+                            ft.Icon(ft.icons.CABLE, size=16, color=ft.colors.GREY_600),
+                            ft.Text("Portas abertas:", size=13, weight=ft.FontWeight.BOLD)
+                        ], spacing=5),
+                        ft.Row(port_badges, wrap=True, spacing=5)
+                    ], spacing=5)
+                ], spacing=8)
+            ], spacing=15),
+            bgcolor=ft.colors.WHITE,
+            padding=20,
+            border_radius=10,
+            border=ft.border.all(2, self.colors['success']),
+            shadow=ft.BoxShadow(
+                spread_radius=1,
+                blur_radius=10,
+                color=ft.colors.with_opacity(0.1, ft.colors.BLACK),
+            )
+        )
+        
+        self.results_column.controls.append(printer_card)
+        self.page.update()
+    
+    def update_status(self, message: str, icon: str = "ℹ", color: str = None):
+        """Atualiza status"""
+        self.status_text.value = f"{icon} {message}"
+        self.status_text.color = color or ft.colors.GREY_700
+        self.page.update()
+    
+    def start_scan(self, e):
+        """Inicia o escaneamento"""
         if self.scanning:
             return
         
-        subnets = self.subnet_entry.get().split()
+        subnets = self.subnet_field.value.split()
         if not subnets:
-            self.log("⚠️ Digite pelo menos uma sub-rede!", "warning")
+            self.update_status("Digite pelo menos uma sub-rede!", "⚠", self.colors['warning'])
             return
         
         self.scanning = True
-        self.scan_button.config(state="disabled")
-        self.results_text.delete(1.0, tk.END)
+        self.scan_button.disabled = True
+        self.results_column.controls.clear()
         self.printers = []
+        self.page.update()
         
-        threads = int(self.threads_spinbox.get())
+        threads = int(self.threads_field.value)
         
-        scan_thread = threading.Thread(target=self.scan_subnets, 
-                                       args=(subnets, threads))
+        self.update_status("Iniciando escaneamento...", "⟳", self.colors['primary'])
+        
+        scan_thread = threading.Thread(target=self.scan_subnets, args=(subnets, threads))
         scan_thread.daemon = True
         scan_thread.start()
     
     def scan_subnets(self, subnets, max_workers):
-        """Escaneia as sub-redes"""
+        """Escaneia sub-redes"""
         start_time = time.time()
         
-        self.log("="*80, "header")
-        self.log("🚀 INICIANDO SCANNER DE IMPRESSORAS", "header")
-        self.log("="*80, "header")
+        self.add_log("═" * 80, ft.colors.BLUE_700)
+        self.add_log("🚀 SCANNER DE IMPRESSORAS INICIADO", ft.colors.BLUE_700)
+        self.add_log("═" * 80, ft.colors.BLUE_700)
+        self.add_log("")
         
         for subnet in subnets:
             self.scan_single_subnet(subnet, max_workers)
         
         elapsed = time.time() - start_time
         
-        self.log("\n" + "="*80, "header")
-        self.log(f"✅ SCAN FINALIZADO", "header")
-        self.log("="*80, "header")
-        self.log(f"Total de impressoras: {len(self.printers)}", "success")
-        self.log(f"Tempo total: {elapsed:.2f}s", "info")
-        
-        if self.printers:
-            self.log("\n📋 RESUMO:", "header")
-            for p in self.printers:
-                self.log(f"  • {p.ip} - {p.model} ({p.page_count:,} páginas)", "info")
+        self.add_log("")
+        self.add_log("═" * 80, ft.colors.GREEN_700)
+        self.add_log("✅ ESCANEAMENTO CONCLUÍDO", ft.colors.GREEN_700)
+        self.add_log("═" * 80, ft.colors.GREEN_700)
+        self.add_log(f"📊 Impressoras encontradas: {len(self.printers)}", ft.colors.BLACK87)
+        self.add_log(f"⏱️  Tempo de execução: {elapsed:.2f}s", ft.colors.BLACK87)
         
         self.scanning = False
-        self.scan_button.config(state="normal")
-        self.status_label.config(text="Scan concluído!")
+        self.scan_button.disabled = False
+        self.update_status("Escaneamento concluído!", "✓", self.colors['success'])
+        self.stats_text.value = f"{len(self.printers)} impressora(s) encontrada(s)"
+        self.page.update()
     
     def scan_single_subnet(self, subnet, max_workers):
         """Escaneia uma única sub-rede"""
         try:
             network = ipaddress.ip_network(subnet, strict=False)
-            self.log(f"\n🔍 Escaneando: {subnet}", "info")
+            self.add_log(f"🔍 Escaneando: {subnet}", ft.colors.BLUE_600)
             
             total = network.num_addresses
             if total > 1000:
-                self.log(f"⚠️ Rede grande ({total} hosts). Limitando a 1000.", "warning")
+                self.add_log(f"⚠️  Rede grande ({total:,} hosts). Limitando a 1000.", self.colors['warning'])
                 hosts = list(network.hosts())[:1000]
             else:
                 hosts = list(network.hosts())
             
-            self.log(f"📊 Hosts: {len(hosts)} | Threads: {max_workers}", "info")
+            self.add_log(f"📊 Total de hosts: {len(hosts):,}", ft.colors.GREY_700)
+            self.add_log("")
             
             progress = ProgressTracker(len(hosts))
-            self.progress_bar['maximum'] = len(hosts)
-            self.progress_bar['value'] = 0
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(scan_single_host, str(ip)): ip 
-                          for ip in hosts}
+                futures = {executor.submit(scan_single_host, str(ip)): ip for ip in hosts}
                 
                 for future in as_completed(futures):
                     current = progress.increment()
-                    self.progress_bar['value'] = current
-                    self.status_label.config(
-                        text=f"Escaneando: {current}/{len(hosts)} hosts"
+                    percentage = (current / len(hosts))
+                    
+                    self.progress_bar.value = percentage
+                    self.update_status(
+                        f"Escaneando: {current}/{len(hosts)} hosts ({percentage*100:.1f}%)",
+                        "⟳",
+                        self.colors['primary']
                     )
-                    
-                    ip_str, printer_info, status = future.result()
-                    
-                    if status == "success" and printer_info:
-                        self.printers.append(printer_info)
-                        self.log("\n" + "="*80, "success")
-                        self.log(f"🖨️ IMPRESSORA ENCONTRADA: {printer_info.ip}", "success")
-                        self.log("="*80, "success")
-                        self.log(f"  Modelo: {printer_info.model}", "info")
-                        if printer_info.hostname:
-                            self.log(f"  Nome: {printer_info.hostname}", "info")
-                        self.log(f"  Páginas: {printer_info.page_count:,}", "info")
-                        self.log("  Portas abertas:", "info")
-                        for port, service in printer_info.open_ports.items():
-                            self.log(f"    • {port} - {service}", "info")
-        
-        except ValueError as e:
-            self.log(f"❌ Erro: Sub-rede inválida '{subnet}': {e}", "warning")
-
-
-def main():
-    """Função principal"""
-    parser = argparse.ArgumentParser(
-        description='Scanner de Impressoras - IPv4/IPv6',
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    
-    parser.add_argument('subnets', nargs='*',
-                       help='Sub-redes em CIDR (ex: 192.168.1.0/24)')
-    parser.add_argument('-w', '--workers', type=int, default=100,
-                       help='Threads paralelas (padrão: 100)')
-    parser.add_argument('--no-gui', action='store_true',
-                       help='Forçar modo console')
-    
-    args = parser.parse_args()
-    
-    # Se argumentos foram passados ou GUI não disponível, usa modo console
-    if args.subnets or args.no_gui or not GUI_AVAILABLE:
-        if not args.subnets:
-            print("Erro: Especifique pelo menos uma sub-rede")
-            parser.print_help()
-            sys.exit(1)
-        
-        print("\n🖨️  SCANNER DE IMPRESSORAS EM REDE")
-        start_time = time.time()
-        all_printers = []
-        
-        for subnet in args.subnets:
-            printers = scan_subnet_console(subnet, max_workers=args.workers)
-            all_printers.extend(printers)
-        
-        elapsed = time.time() - start_time
-        
-        print(f"\n{'='*70}")
-        print(f"✅ SCAN FINALIZADO")
-        print(f"{'='*70}")
-        print(f"Total de impressoras: {len(all_printers)}")
-        print(f"Tempo total: {elapsed:.2f}s")
-        
-        if all_printers:
-            print("\n📋 RESUMO:")
-            for p in all_printers:
-                print(f"  • {p.ip} - {p.model} ({p.page_count:,} páginas)")
-    else:
-        # Inicia interface gráfica
-        root = tk.Tk()
-        app = PrinterScannerGUI(root)
-        root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+                    self.stats_text.value = f"{len(self.printer
