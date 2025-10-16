@@ -581,4 +581,34 @@ class PrinterScannerApp:
                         "⟳",
                         self.colors['primary']
                     )
-                    self.stats_text.value = f"{len(self.printer
+                    self.stats_text.value =  f"{len(self.printers)} encontrada(s) • {current}/{len(hosts)}"
+                    self.page.update()
+                    
+                    ip_str, printer_info, status = future.result()
+                    
+                    if status == "success" and printer_info:
+                        self.printers.append(printer_info)
+                        self.add_printer_card(printer_info)
+            
+            self.add_log("")
+            self.add_log(f"✓ Sub-rede {subnet} concluída\n", ft.colors.GREEN_600)
+        
+        except ValueError as e:
+            self.add_log(f"❌ Erro: {e}", self.colors['danger'])
+
+
+def main_gui():
+    """Inicia a aplicação Flet"""
+    def start_app(page: ft.Page):
+        app = PrinterScannerApp(page)
+    
+    ft.app(target=start_app)
+
+
+if __name__ == "__main__":
+    if not FLET_AVAILABLE:
+        print("Erro: Flet não está instalado.")
+        print("Instale com: pip install flet")
+        sys.exit(1)
+    
+    main_gui()
