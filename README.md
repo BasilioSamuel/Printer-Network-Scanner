@@ -41,7 +41,7 @@ Durante o processo, aprimorei meus conhecimentos sobre:
 
 ```bash
 # Clone o repositório
-git clone https://github.com/seuusuario/printer-network-scanner.git
+git clone https://github.com/basiliosamuel/printer-network-scanner.git
 
 # Acesse o diretório
 cd printer-network-scanner
